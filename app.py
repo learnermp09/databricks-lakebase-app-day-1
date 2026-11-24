@@ -28,6 +28,7 @@ _w = WorkspaceClient()
 
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
+NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news")
 
 # Basic stock ticker shape check: 1-10 uppercase letters, with an optional
 # ".X" or ".XX" share-class suffix (e.g. "BRK.B"). This rejects obviously
@@ -58,6 +59,23 @@ def ensure_watchlist_table():
             latest_price NUMERIC,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (symbol, email)
+        )
+        """
+    )
+
+
+def ensure_news_table():
+    """Create the ticker_news table in Lakebase if it doesn't exist yet."""
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {NEWS_TABLE_NAME} (
+            id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            title TEXT NOT NULL,
+            publisher TEXT,
+            article_url TEXT,
+            published_utc TIMESTAMPTZ,
+            fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """
     )
@@ -215,6 +233,120 @@ def delete_from_watchlist(symbol):
         return jsonify({"error": f"{symbol} is not on your watchlist"}), 404
 
     return jsonify({"symbol": symbol, "email": email, "deleted": deleted})
+
+
+@app.route("/news/<symbol>", methods=["GET"])
+def get_news(symbol):
+    """Return news headlines already stored in Lakebase for a ticker."""
+    ensure_news_table()
+    symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
+    if not symbol or not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
+
+    limit = int(request.args.get("limit", 10))
+    rows = lakebase.run_query(
+        f"SELECT id, symbol, title, publisher, article_url, published_utc "
+        f"FROM {NEWS_TABLE_NAME} WHERE symbol = %s "
+        f"ORDER BY published_utc DESC NULLS LAST, fetched_at DESC LIMIT %s",
+        (symbol, limit),
+    )
+    return jsonify(rows)
+
+
+@app.route("/news/<symbol>", methods=["POST"])
+def fetch_news(symbol):
+    """
+    Fetch the latest news for a single stock symbol from Massive using
+    exactly ONE API call (see MassiveClient.get_news), upsert the
+    headlines into the ticker_news table in Lakebase, and return them.
+    """
+    ensure_news_table()
+    symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
+    if not symbol or not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
+
+    client = MassiveClient()
+    try:
+        data = client.get_news(symbol)
+    except requests.HTTPError:
+        # Massive returns a 404/4xx when the news endpoint or ticker fails.
+        return jsonify({"error": f"Could not fetch news for ticker: {symbol}"}), 400
+
+    stored = _store_news(symbol, data)
+
+    rows = lakebase.run_query(
+        f"SELECT id, symbol, title, publisher, article_url, published_utc "
+        f"FROM {NEWS_TABLE_NAME} WHERE symbol = %s "
+        f"ORDER BY published_utc DESC NULLS LAST, fetched_at DESC LIMIT 10",
+        (symbol,),
+    )
+    return jsonify({"symbol": symbol, "stored": stored, "news": rows})
+
+
+def _store_news(symbol: str, data: dict) -> int:
+    """Upsert the articles from a Massive news response into ticker_news.
+
+    The /v2/reference/news endpoint returns "results" as a LIST of article
+    objects, each with an id, title, article_url, published_utc, and a
+    nested "publisher" object. Items without a usable title are skipped;
+    items without an id get a deterministic fallback id so re-fetches
+    upsert instead of duplicating rows.
+    """
+    import hashlib
+
+    if not isinstance(data, dict):
+        return 0
+    results = data.get("results", [])
+    if not isinstance(results, list):
+        return 0
+
+    count = 0
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            for item in results:
+                if not isinstance(item, dict) or not item.get("title"):
+                    continue
+                title = str(item["title"])
+                published = item.get("published_utc") or item.get("published")
+                # Only pass through ISO-string timestamps; anything else
+                # (epoch numbers, nested objects) would fail the timestamptz
+                # cast, so store NULL instead.
+                if published is not None and not isinstance(published, str):
+                    published = None
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    item_id = hashlib.sha256(
+                        f"{symbol}|{title}|{published}".encode("utf-8")
+                    ).hexdigest()
+                publisher = item.get("publisher")
+                if isinstance(publisher, dict):
+                    publisher = publisher.get("name")
+                if publisher is not None and not isinstance(publisher, str):
+                    publisher = str(publisher)
+                cur.execute(
+                    f"""
+                    INSERT INTO {NEWS_TABLE_NAME}
+                        (id, symbol, title, publisher, article_url, published_utc, fetched_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (id) DO UPDATE
+                        SET title = EXCLUDED.title,
+                            publisher = EXCLUDED.publisher,
+                            article_url = EXCLUDED.article_url,
+                            published_utc = EXCLUDED.published_utc,
+                            fetched_at = EXCLUDED.fetched_at
+                    """,
+                    (
+                        item_id,
+                        symbol,
+                        title,
+                        publisher,
+                        item.get("article_url") or item.get("url"),
+                        published,
+                    ),
+                )
+                count += 1
+            conn.commit()
+    return count
 
 
 def _extract_latest_price(data: dict) -> float | None:

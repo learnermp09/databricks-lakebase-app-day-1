@@ -85,3 +85,19 @@ class MassiveClient:
         """
         data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
         return data
+
+    def get_news(self, symbol: str, limit: int = 10) -> dict:
+        """
+        Fetch the latest news headlines for a single symbol in a SINGLE API
+        call. Returns the raw response, expected shape (one "results" list
+        of article objects):
+            {"status": "OK", "results": [{"id": ..., "title": ...,
+              "article_url": ..., "published_utc": ...,
+              "publisher": {"name": ...}, ...}, ...]}
+        Adjust the endpoint path/params here if the real Massive news
+        endpoint differs.
+        """
+        return self.get(
+            "/v2/reference/news",
+            params={"ticker": symbol, "limit": limit},
+        )

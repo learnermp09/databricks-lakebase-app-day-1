@@ -174,6 +174,20 @@
 
     td:first-child { font-weight: 700; }
 
+    button.news-btn { padding: 5px 12px; font-size: 13px; }
+
+    .news-list { list-style: none; margin: 0; padding: 0; }
+    .news-item { padding: 12px 0; border-bottom: 1px solid var(--border); }
+    .news-item:last-child { border-bottom: none; }
+    .news-item a {
+      color: var(--accent);
+      font-weight: 600;
+      text-decoration: none;
+      font-size: 14.5px;
+    }
+    .news-item a:hover { text-decoration: underline; }
+    .news-meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+
     @media (max-width: 560px) {
       .input-row { flex-direction: column; }
       body { margin: 24px auto; }
@@ -217,10 +231,19 @@
         <th>Email</th>
         <th>Latest price</th>
         <th>Updated</th>
+        <th>News</th>
       </tr>
     </thead>
     <tbody id="watchlist-body"></tbody>
   </table>
+  </div>
+
+  <div class="card" id="news-card" style="display: none;">
+    <div class="table-head">
+      <h2 id="news-title">News</h2>
+      <button type="button" id="news-close" class="secondary">Close</button>
+    </div>
+    <ul class="news-list" id="news-list"></ul>
   </div>
 
   <script>
@@ -254,6 +277,19 @@
             td.textContent = value;
             tr.appendChild(td);
           });
+
+          const newsTd = document.createElement("td");
+          const newsBtn = document.createElement("button");
+          newsBtn.type = "button";
+          newsBtn.className = "secondary news-btn";
+          newsBtn.textContent = "News";
+          newsBtn.addEventListener("click", (e) => {
+            // Don't toggle row selection when clicking the News button.
+            e.stopPropagation();
+            fetchNews(row.symbol);
+          });
+          newsTd.appendChild(newsBtn);
+          tr.appendChild(newsTd);
 
           tr.addEventListener("click", () => {
             if (selectedSymbols.has(row.symbol)) {
@@ -333,6 +369,64 @@
       } catch (err) {
         resultEl.textContent = "Request failed: " + err;
       }
+    });
+
+    const newsCard = document.getElementById("news-card");
+    const newsTitle = document.getElementById("news-title");
+    const newsList = document.getElementById("news-list");
+
+    function renderNews(symbol, news) {
+      newsTitle.textContent = "News for " + symbol;
+      newsList.innerHTML = "";
+      if (!news || news.length === 0) {
+        const li = document.createElement("li");
+        li.className = "news-item";
+        li.textContent = "No news found for " + symbol + ".";
+        newsList.appendChild(li);
+      } else {
+        news.forEach((item) => {
+          const li = document.createElement("li");
+          li.className = "news-item";
+
+          const a = document.createElement("a");
+          a.href = item.article_url || "#";
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.textContent = item.title;
+          li.appendChild(a);
+
+          const meta = document.createElement("div");
+          meta.className = "news-meta";
+          const when = item.published_utc
+            ? new Date(item.published_utc).toLocaleString()
+            : "unknown date";
+          meta.textContent = (item.publisher || "Unknown publisher") + " · " + when;
+          li.appendChild(meta);
+
+          newsList.appendChild(li);
+        });
+      }
+      newsCard.style.display = "";
+    }
+
+    async function fetchNews(symbol) {
+      resultEl.textContent = "Fetching news for " + symbol + "...";
+      try {
+        const resp = await fetch("/news/" + encodeURIComponent(symbol), { method: "POST" });
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error: " + (data.error || resp.statusText);
+          return;
+        }
+        resultEl.textContent = "Fetched " + data.stored + " news item(s) for " + symbol + " (stored in Lakebase).";
+        renderNews(symbol, data.news);
+      } catch (err) {
+        resultEl.textContent = "News request failed: " + err;
+      }
+    }
+
+    document.getElementById("news-close").addEventListener("click", () => {
+      newsCard.style.display = "none";
     });
 
     loadWatchlist();
